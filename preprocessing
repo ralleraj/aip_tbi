@@ -2,4 +2,89 @@
 # Preprocessing steps for trainign of the ICP-MAP-CPP algorithm in the development cohort
 # Note that the code may need modifications in order to fit other datasets
 
-CODE HERE
+import numpy as np 
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm.notebook import tqdm
+from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.model_selection import StratifiedKFold, LeaveOneOut
+from sklearn.metrics import roc_auc_score, accuracy_score, confusion_matrix, precision_score
+from sklearn.metrics import precision_recall_curve
+
+df1 = pd.read_csv('static.csv', delimiter=",") # Path to static parameters such as age
+df_map = pd.read_csv('MAP_all.csv', delimiter=",") # MAP values for all patients
+df_icp = pd.read_csv('ICP_all.csv', delimiter=",") # ICP values for all patients
+
+df_icp['time'] = pd.to_datetime(df_icp['time'])
+df_map['time'] = pd.to_datetime(df_map['time'])
+df_icp.time = df_icp.time.values.astype('<M8[m]')
+df_map.time = df_map.time.values.astype('<M8[m]')
+
+df_icp = df_icp[['id', 'icp', 'time']]
+df_map = df_map[['id', 'map', 'time']]
+
+df_icp.drop_duplicates(keep=False, inplace=True) # Remove duplicate rows
+df_map.drop_duplicates(keep=False, inplace=True) # Remove duplicate rows
+
+df2 = pd.merge(df_icp,df_map,on=['id', 'time'], how='inner')
+
+df1 = df1[['id', 'agec', 'dead30']]
+df2 = df2[['id', 'time', 'icp', 'map']]
+
+df2.replace(' ', np.nan, inplace=True)
+df2.drop_duplicates(keep=False, inplace=True) # Remove duplicate rows from df2
+df2.dropna(subset = ['icp'], inplace=True)
+df2.dropna(subset = ['map'], inplace=True)
+
+df2['cpp'] = df2.map - df2.icp
+
+df1 = df1.sort_values('id').reset_index(drop = True)
+df2 = df2.sort_values(['id', 'time']).reset_index(drop = True)
+
+# get the begin time of the ICP measurements for each patient
+begin_time = df2.dropna(subset = ['icp']).groupby('id')['time'].first()
+
+df2 = pd.merge(df2, begin_time, on = "id")
+df2['delta'] = df2['time_x'] - df2['time_y']
+
+# calculate time since beginning of any measurement
+df2['delta'] = df2.groupby('id')['time_x'].apply(lambda x: x - x.iloc[0])
+
+# drop the extra date columns
+df2 = df2.drop(['time_x', 'time_y'], axis = 1)
+
+# remove values before patients first icp measurement
+df2 = df2[df2['delta'] >= '0h' ]
+
+# remove patients with ICP data less than 24 hours
+df2['test']= df2['delta'].apply(lambda x: 'True' if x > pd.Timedelta(24, unit = 'h') else 'False') 
+keep_samples = df2[df2['test']=='True']['id']
+keep_samples = list(set(keep_samples))
+df2 = df2[df2['id'].isin(keep_samples)]
+df2 = df2.drop('test', axis = 1)
+
+# create similar dataframes as there is in the code of original the paper
+df_icp = df2.loc[:,['id', 'icp', 'delta']]
+df_map = df2.loc[:,['id', 'map', 'delta']]
+df_cpp = df2.loc[:,['id', 'cpp', 'delta']]
+df_icp = df_icp.rename(columns = {'icp' : 'value'})
+df_map = df_map.rename(columns = {'map' : 'value'})
+df_cpp = df_cpp.rename(columns = {'cpp' : 'value'})
+
+# filter out outliers
+df_map = df_map[df_map['value'] < 150]
+df_map = df_map[df_map['value'] > 0]
+df_icp = df_icp[df_icp['value'] < 100]
+df_icp = df_icp[df_icp['value'] > 0]
+df_cpp = df_cpp[df_cpp['value'] > 0]
+df_cpp = df_cpp[df_cpp['value'] < 150]
+
+# remove patients that did not have valid ICP or MAP measurements from the data
+df_patients = df1[df1.id.isin(df2.id.unique())]
+
+#check the remaining number of patients
+column_values = df_patients['id'].values
+unique_values =  np.unique(column_values)
+c = len(unique_values)
+print(c)
