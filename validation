@@ -1,3 +1,536 @@
 ## Code for algorithm validation
 
-CODE HERE
+import numpy as np 
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm.notebook import tqdm
+from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.model_selection import StratifiedKFold, LeaveOneOut
+from sklearn.metrics import roc_auc_score, accuracy_score, confusion_matrix, precision_score
+from sklearn.metrics import precision_recall_curve
+
+def create_derived_series(df_patients, df_icp, df_map, df_cpp):
+  """ This function derives various new time series for each patient from the original ICP, MAP, and CPP data. """
+  
+  # Take the intersection of available patient ids.
+  ids = list(set(df_patients['id']) & set(df_icp['id']) & set(df_map['id']))
+  
+  # The dictionary below holds various types of derived series as keys the values of which are dictionaries indexed by patient ids.
+  # To add a new type of derived series, make and empty entry to the dictionary and provide a logic for its computation for each patient in the for loop below.
+  derived_series = {'icp': {}, 'map': {}, 'cpp': {},
+                    'icp_var': {}, 'map_var': {}, 'cpp_var': {},
+                    'icp_ht20': {}, 'map_ht120': {}, 'icp_lt10': {},
+                    'icp_diff': {}, 'map_diff': {}, 'cpp_diff': {},
+                    'icp_q10': {}, 'icp_q90': {},
+                    'map_q10': {}, 'map_q90': {},
+                    'cpp_q10': {}, 'cpp_q90': {}}
+  
+  # Set the length of the rolling window. Feel free to experiment with values other than '4h'.
+  rolling_window_length = '4h'
+
+  # Loop over patient ids and 
+  for i in tqdm(ids, ncols=1000, desc="Create series"):
+    # data as is
+    derived_series['icp'][i] = df_icp[df_icp['id'] == i].drop('id', axis=1).set_index('delta')
+    derived_series['map'][i] = df_map[df_map['id'] == i].drop('id', axis=1).set_index('delta')
+    derived_series['cpp'][i] = df_cpp[df_cpp['id'] == i].drop('id', axis=1).set_index('delta')
+    # variance
+    derived_series['icp_var'][i] = df_icp[df_icp['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).var().dropna()
+    derived_series['map_var'][i] = df_map[df_map['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).var().dropna()
+    derived_series['cpp_var'][i] = df_cpp[df_cpp['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).var().dropna()
+    # cut-off percentage
+    derived_series['icp_ht20'][i] = df_icp[df_icp['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).apply(lambda window: 100*(window > 20).mean(), raw=True)
+    derived_series['map_ht120'][i] = df_map[df_map['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).apply(lambda window: 100*(window > 120).mean(), raw=True)
+    derived_series['icp_lt10'][i] = df_icp[df_icp['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).apply(lambda window: 100*(window < 10).mean(), raw=True)
+    # magnitude of difference
+    derived_series['icp_diff'][i] = df_icp[df_icp['id'] == i].drop('id', axis=1).set_index('delta').diff().abs().rolling(rolling_window_length).mean().dropna()
+    derived_series['map_diff'][i] = df_map[df_map['id'] == i].drop('id', axis=1).set_index('delta').diff().abs().rolling(rolling_window_length).mean().dropna()
+    derived_series['cpp_diff'][i] = df_cpp[df_cpp['id'] == i].drop('id', axis=1).set_index('delta').diff().abs().rolling(rolling_window_length).mean().dropna()
+    # quantile
+    derived_series['icp_q10'][i] = df_icp[df_icp['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).quantile(0.1).dropna()
+    derived_series['icp_q90'][i] = df_icp[df_icp['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).quantile(0.9).dropna()
+    derived_series['map_q10'][i] = df_map[df_map['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).quantile(0.1).dropna()
+    derived_series['map_q90'][i] = df_map[df_map['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).quantile(0.9).dropna()
+    derived_series['cpp_q10'][i] = df_cpp[df_cpp['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).quantile(0.1).dropna()
+    derived_series['cpp_q90'][i] = df_cpp[df_cpp['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).quantile(0.9).dropna()
+    
+  return derived_series
+
+def compute_features(series):
+  """ For a given time series, compute the initial 24h mean, the final 8h mean, and the regression coefficient. """
+  begin_mean = series[series.index < pd.to_timedelta('24h')]['value'].mean()
+  end_mean = series[series.index > series.index.values[-1] - pd.to_timedelta('8h')]['value'].mean()
+  coef = LinearRegression().fit(series.index.values.reshape(-1,1), series['value']).coef_[0]
+  return begin_mean, end_mean, coef
+
+def prepare_data(df_patients, df_icp, df_map, df_cpp):
+  """ This function prepares the full dataframe of features from the patient and monitor data. """
+  
+  ids = list(set(df_patients['id']) & set(df_icp['id']) & set(df_map['id']))
+  derived_series = create_derived_series(df_patients, df_icp, df_map, df_cpp)
+  
+  # For each type of derived series, initialize a dataframe with begin, end, and coef features.
+  feature_dfs = {name: pd.DataFrame(index=ids, columns=[name + '_begin', name + '_end', name + '_coef'], dtype=np.float32) for name in derived_series}
+  
+  #series = tqdm_notebook(derived_series, ncols=1000)
+  series = tqdm(derived_series, ncols=1000)
+  
+  # For each type of derived series populate the corresponding feature dataframe by computing the features for each patient.
+  for name in series:
+    series.set_description("%s" % name)
+    for i in ids:
+      try:  
+        feature_dfs[name].loc[i] = compute_features(derived_series[name][i])
+      except:
+        continue
+
+  # Join all the feature dataframes with the patients data.
+  monitordata = df_patients.set_index('id').join(feature_dfs.values(), how='inner')
+  monitordata.dropna(inplace=True)
+  monitordata = monitordata.sample(frac=1) # Shuffle the dataframe.
+  data = monitordata.drop('dead30', axis=1)
+  target = monitordata['dead30']
+  return data, target
+
+def multiprocess_prepare_data(df_patients, df_icp, df_map, df_cpp, return_dict, hour):
+  """ This function prepares the full dataframe of features from the patient and monitor data. """
+  
+  ids = list(set(df_patients['id']) & set(df_icp['id']) & set(df_map['id']))
+  derived_series = create_derived_series(df_patients, df_icp, df_map, df_cpp)
+  
+  # For each type of derived series, initialize a dataframe with begin, end, and coef features.
+  feature_dfs = {name: pd.DataFrame(index=ids, columns=[name + '_begin', name + '_end', name + '_coef'], dtype=np.float32) for name in derived_series}
+  
+  series = tqdm(derived_series, ncols=1000)
+  
+  # For each type of derived series populate the corresponding feature dataframe by computing the features for each patient.
+  for name in series:
+    series.set_description("%s" % name)
+    for i in ids:
+      try:  
+        feature_dfs[name].loc[i] = compute_features(derived_series[name][i])
+      except:
+        continue
+
+  # Join all the feature dataframes with the patients data.
+  monitordata = df_patients.set_index('id').join(feature_dfs.values(), how='inner')
+  monitordata.dropna(inplace=True)
+  monitordata = monitordata.sample(frac=1) # Shuffle the dataframe.
+  data = monitordata.drop('dead30', axis=1)
+  target = monitordata['dead30']
+  
+  return_dict[hour] = data
+
+# read in the test data
+df1 = pd.read_csv('static_test.csv', delimiter=",") # Path to static parameters such as age
+df_map = pd.read_csv('MAP_all_test.csv', delimiter=",") # MAP values for all patients
+df_icp = pd.read_csv('ICP_all_test.csv', delimiter=",") # ICP values for all patients
+
+# preprocesss the test data same way as the training data was preprocessed
+df1.rename(columns = {'age':'agec'}, inplace = True)
+df_icp.rename(columns = {'icp_time':'time'}, inplace = True)
+df_map.rename(columns = {'map_time':'time'}, inplace = True)
+df_icp['time'] = pd.to_datetime(df_icp['time'])
+df_map['time'] = pd.to_datetime(df_map['time'])
+df_icp.time = df_icp.time.values.astype('<M8[m]')
+df_map.time = df_map.time.values.astype('<M8[m]')
+
+df2 = pd.merge(df_icp, df_map, how='left', left_on=['id','time'], right_on=['id','time'])
+
+df1 = df1[['id', 'agec', 'dead30']]
+
+df2 = df2[['id', 'time', 'icp', 'map']]
+
+df1.drop_duplicates(keep='first', inplace=True) # Remove duplicate rows from df1
+df2.drop_duplicates(keep='first', inplace=True) # Remove duplicate rows from df2
+df2.dropna(subset = ['icp'], inplace=True)
+df2.dropna(subset = ['map'], inplace=True)
+
+df2['cpp'] = df2.map - df2.icp
+
+df2.drop(df2.index[df2['icp'] < 0], inplace = True)
+df2.drop(df2.index[df2['icp'] > 100], inplace = True)
+df2.drop(df2.index[df2['map'] < 0], inplace = True)
+df2.drop(df2.index[df2['map'] > 150], inplace = True)
+df2.drop(df2.index[df2['cpp'] < 0], inplace = True)
+df2.drop(df2.index[df2['cpp'] > 150], inplace = True)
+
+df2.replace(' ', np.nan, inplace=True)
+
+df1 = df1.sort_values('id').reset_index(drop = True)
+df2 = df2.sort_values(['id', 'time']).reset_index(drop = True)
+
+# get the begin time of the ICP measurements for each patient
+begin_time = df2.dropna(subset = ['icp']).groupby('id')['time'].first()
+
+df2 = pd.merge(df2, begin_time, on = "id")
+df2['delta'] = df2['time_x'] - df2['time_y']
+
+# calculate time since beginning of any measurement
+df2['delta'] = df2.groupby('id')['time_x'].apply(lambda x: x - x.iloc[0])
+
+#Removing patients with information less than 24 hours
+df2['test']= df2['delta'].apply(lambda x: 'True' if x > pd.Timedelta(24, unit = 'h') else 'False') 
+keep_samples = df2[df2['test']=='True']['id']
+keep_samples = list(set(keep_samples))
+df2 = df2[df2['id'].isin(keep_samples)]
+df2 = df2.drop('test', axis = 1)
+
+# drop the extra date columns
+df2 = df2.drop(['time_x', 'time_y'], axis = 1)
+
+# remove values before patients first icp measurement
+df2 = df2[df2['delta'] >= '0h' ]
+
+# create similar dataframes as there is in the code of the paper
+df_icp = df2.loc[:,['id', 'icp', 'delta']]
+df_map = df2.loc[:,['id', 'map', 'delta']]
+df_cpp = df2.loc[:,['id', 'cpp', 'delta']]
+df_icp = df_icp.rename(columns = {'icp' : 'value'})
+df_map = df_map.rename(columns = {'map' : 'value'})
+df_cpp = df_cpp.rename(columns = {'cpp' : 'value'})
+
+# filter out outliers
+df_map = df_map[df_map['value'] < 150]
+df_map = df_map[df_map['value'] > 0]
+df_icp = df_icp[df_icp['value'] < 100]
+df_icp = df_icp[df_icp['value'] > 0]
+df_cpp = df_cpp[df_cpp['value'] > 0]
+df_cpp = df_cpp[df_cpp['value'] < 150]
+
+# a couple of patients did not have valid ICP or MAP measurements, remove them from the data
+df_pat = df1[df1.id.isin(df2.id.unique())]
+
+def age_to_agecat(x):
+	return int(x/10)
+
+df_pat['agec'] = df_pat['agec'].astype(int)
+df_patients = df_pat.copy()
+df_patients['agec'] = df_patients['agec'].apply(age_to_agecat)
+
+from sklearn.preprocessing import StandardScaler
+
+# Calculate features for the full dataset
+test_data_full, test_target = prepare_data(df_patients, df_icp, df_map, df_cpp)
+
+# Scale the features
+scaler = StandardScaler()
+test_data_scaled = pd.DataFrame(data=scaler.fit_transform(test_data_full), index=test_data_full.index, columns=test_data_full.columns)
+
+# Sort indices
+test_data = test_data_scaled.sort_index()
+test_target = test_target.sort_index()
+
+# Create dictionaries for the features
+test_data_full_pred = dict()  # All the features computed from truncated time series 
+test_data_pred = dict()  # All the scaled features
+
+import multiprocessing as mp
+
+hours = range(24, 128, 8)
+manager = mp.Manager()
+test_data_full_pred = manager.dict()
+n_cores = 4
+
+# created pool running maximum 4 cores
+pool = mp.Pool(n_cores)
+
+# Execute the feature calculation in parallel
+for hour in hours:
+    pool.apply_async(multiprocess_prepare_data, args=(df_patients, 
+                                                      df_icp[df_icp.delta < str(hour) + "h"],
+                                                      df_map[df_map.delta < str(hour) + "h"],
+                                                      df_cpp[df_cpp.delta < str(hour) + "h"],
+                                                      test_data_full_pred, 
+                                                      hour))
+
+# Tell the pool that there are no more tasks to come and join
+pool.close()
+pool.join()
+
+for hour in hours:
+  test_data_pred[hour] = pd.DataFrame(data=scaler.transform(test_data_full_pred[hour]), index=test_data_full_pred[hour].index, columns=test_data_full_pred[hour].columns)
+  test_data_pred[hour] = test_data_pred[hour].sort_index()
+
+test_target = test_target.astype(int)
+df_test_target = pd.DataFrame(test_target)
+
+print('Number of patients: {}'.format(len(df_test_target)))
+print('Survived at least 30 days: {}'.format(len(df_test_target.loc[df_test_target['dead30'] == 0])))
+print('Deceased within 30 days: {}'.format(len(df_test_target.loc[df_test_target['dead30'] == 1])))
+print('Percentage of deceased: {}%'.format(np.round(100 * len(df_test_target.loc[df_test_target['dead30'] == 1]) / len(df_test_target), 2)))
+
+from sklearn.metrics import make_scorer, precision_recall_curve, auc
+from sklearn.metrics import matthews_corrcoef
+
+def custom_pr_auc(y_true, y_pred):
+    precision, recall, _ = precision_recall_curve(y_true, y_pred)
+    score=auc(recall, precision)
+    return score
+
+pr_auc = make_scorer(custom_pr_auc, greater_is_better = True)
+
+aucs_train = dict()
+aucs_test = dict()
+
+pr_aucs_train = dict()
+pr_aucs_test = dict()
+
+precision_train = dict()
+precision_test = dict()
+
+accuracy_train = dict()
+accuracy_test = dict()
+
+cm_train = dict()
+cm_test = dict()
+
+preds_test_all = dict()
+preds_test_all_rounded = dict()
+
+for hours in range(24, 128, 8):
+    aucs_train[hours] = list()
+    aucs_test[hours] = list()
+    
+    pr_aucs_train[hours] = list()
+    pr_aucs_test[hours] = list()
+    
+    precision_train[hours] = list()
+    precision_test[hours] = list()
+    
+    accuracy_train[hours] = list()
+    accuracy_test[hours] = list()
+    
+    cm_train[hours] = list()
+    cm_test[hours] = list()
+
+    preds_test_all[hours] = list()
+    preds_test_all_rounded[hours] = list()
+
+def set_threshold(x):
+  if (x > 0.50):
+    x = 1
+  else:
+    x = 0
+  return x
+
+test_patients = test_data.index.tolist()
+
+from sklearn.metrics import precision_score
+from sklearn.model_selection import RepeatedStratifiedKFold
+
+fold_method = RepeatedStratifiedKFold(n_splits=5, n_repeats=20, random_state = 1)
+
+### read in 'selected_columns' here
+test_data = test_data[selected_columns] #selected colums i.e. the chosen features; see file 'AIP_TBI_training'
+
+for test_indices, test_indices2 in fold_method.split(test_data, test_target):
+  test_patients, test_patients2 = test_data.index[test_indices], test_data.index[test_indices2]
+  for hours in range(24, 128, 8):
+    preds_test = lr.predict_proba(test_data_pred[hours][selected_columns].loc[test_patients])[:,1]
+    preds_test_rounded = preds_test.round()
+    preds_test_all[hours].append(preds_test)
+    score_test = roc_auc_score(test_target.loc[test_patients], preds_test)  
+    pr_auc_test = custom_pr_auc(test_target.loc[test_patients], preds_test)  
+    prec_score_test = precision_score(test_target.loc[test_patients], preds_test_rounded)
+    aucs_test[hours].append(score_test)  
+    pr_aucs_test[hours].append(pr_auc_test)        
+    precision_test[hours].append(prec_score_test)  
+
+#calculating accuracy and precision over all time points for all patients
+
+from sklearn.metrics import precision_score
+
+test_patients = test_data.index.tolist()
+test_data = test_data[selected_columns]
+
+for hours in range(24, 128, 8):    
+    preds_t = lr.predict_proba(test_data_pred[hours][selected_columns].loc[test_patients])[:,1]
+    df_preds_t = pd.DataFrame(preds_t, columns=['pred_hx'])
+    df_preds_t['pred_hx'] = df_preds_t['pred_hx'].apply(set_threshold)
+    predictions_t = df_preds_t['pred_hx'].to_numpy()
+    preds_t_rounded = predictions_t.round()
+
+    accu_score_test = accuracy_score(test_target.loc[test_patients], preds_t_rounded)
+    cnf_mtx_test = confusion_matrix(test_target.loc[test_patients], preds_t_rounded)
+
+    accuracy_test[hours].append(accu_score_test)  
+    cm_test[hours].append(cnf_mtx_test)
+
+import scipy.stats
+
+def mean_confidence_interval(data, confidence=0.95):
+    
+    scores_mean = []
+    scores_lower = []
+    scores_upper = []
+    for hours in range(24, 128, 8):
+        a = 1.0 * np.array(data[hours])
+        n = len(a)
+        m, se = np.mean(a), scipy.stats.sem(a)
+        se =  np.std(a, ddof=1) / np.sqrt(np.size(a))
+        h = se * scipy.stats.t.ppf((1 + confidence) / 2., n-1)
+        
+        scores_mean.append(m)
+        scores_lower.append(m-h)
+        scores_upper.append(m+h)
+    return scores_mean, scores_lower, scores_upper
+
+def auc_stats(aucs):
+    aucs_mean = []
+    aucs_std = []
+    aucs_lower = []
+    aucs_upper = []
+    for hours in range(24, 128, 8):
+        mean = np.mean(aucs[hours])
+        aucs_mean.append(mean)
+        std = np.std(aucs[hours])
+        aucs_std.append(std)
+        lower = mean - std
+        aucs_lower.append(lower)
+        upper = mean + std
+        aucs_upper.append(upper)
+        
+    return aucs_mean, aucs_lower, aucs_upper
+
+aucs_test_mean, aucs_test_lower, aucs_test_upper = mean_confidence_interval(aucs_test)
+pr_aucs_test_mean, pr_aucs_test_lower, pr_aucs_test_upper = mean_confidence_interval(pr_aucs_test)
+precision_test_mean, precision_test_lower, precision_test_upper = mean_confidence_interval(precision_test)
+
+SMALLER_SIZE = 12
+SMALL_SIZE = 14
+MEDIUM_SIZE = 16
+BIGGER_SIZE = 20
+
+#set font sizes
+plt.rc('font', size=SMALL_SIZE)          # controls default text sizes
+plt.rc('axes', titlesize=SMALL_SIZE)     # fontsize of the axes title
+plt.rc('axes', labelsize=MEDIUM_SIZE)    # fontsize of the x and y labels
+plt.rc('xtick', labelsize=SMALL_SIZE - 1)    # fontsize of the tick labels
+plt.rc('ytick', labelsize=SMALL_SIZE - 1)    # fontsize of the tick labels
+plt.rc('legend', fontsize=SMALLER_SIZE)    # legend fontsize
+plt.rc('figure', titlesize=BIGGER_SIZE)  # fontsize of the figure title
+
+plt.rcParams.update({'font.family' : 'sans-serif', 
+                     'figure.frameon' : False, 
+                     'axes.facecolor' : 'white',
+                     'axes.edgecolor' : 'black',
+                     'grid.color': 'lightgray',
+                     'axes.axisbelow' : True,
+                     'axes.grid' : True,
+                     'legend.frameon' : False,
+                     'axes.spines.top': False,
+                     'axes.spines.right': False})
+
+train_color = 'blue'
+test_color = 'darkorange'
+
+print('Mean AUROC over time: ' + str(np.array(aucs_test_mean).mean().round(3)))
+print('Mean AUROC at 72 h (95 % CI): ' + str(aucs_test_mean[0].round(3)) + ' (' + str(aucs_test_lower[0].round(3)) + ' - ' + str(aucs_test_upper[0].round(3)) + ')')
+print('Mean AUROC at 120 h (95 % CI): ' + str(aucs_test_mean[-1].round(3)) + ' (' + str(aucs_test_lower[-1].round(3)) + ' - ' + str(aucs_test_upper[-1].round(3)) + ')')
+
+time = range(24, 128, 8)
+auroc = np.linspace(0, 1, 11)
+plt.figure(figsize=(12,10))
+plt.plot(time, aucs_test_mean, color=test_color,
+         label=r'Validation of the AIP-TBI algorithm with external data: 464 patients from Stockholm cohort')
+plt.fill_between(time, aucs_test_lower, aucs_test_upper, color=test_color, alpha=.2)
+plt.xlabel('Time after admission (h)')
+plt.ylabel('Area under ROC')
+plt.legend(loc='upper left')
+plt.ylim((0,1.0))
+plt.xlim((24,120))
+plt.xticks(time)
+plt.yticks(auroc)
+plt.tick_params(length = 5)
+plt.savefig('/content/drive/MyDrive/Colab Notebooks/AIP-TBI/Qvik/KI_AUCROC.pdf')
+plt.show()
+
+print('Mean AUPRC over time: ' + str(np.array(pr_aucs_test_mean).mean().round(3)))
+print('Mean AUPRC at 72 h (95 % CI): ' + str(pr_aucs_test_mean[0].round(3)) + ' (' + str(pr_aucs_test_lower[0].round(3)) + ' - ' + str(pr_aucs_test_upper[0].round(3)) + ')')
+print('Mean AUPRC at 120 h (95 % CI): ' + str(pr_aucs_test_mean[-1].round(3)) + ' (' + str(pr_aucs_test_lower[-1].round(3)) + ' - ' + str(pr_aucs_test_upper[-1].round(3)) + ')')
+
+
+"""Let's view how the predictions evolve for each patient. Predictions are plotted on top of their ICP-MAP-CPP data."""
+
+from sklearn.preprocessing import StandardScaler
+scaler = StandardScaler()
+
+from tqdm import tqdm_notebook
+
+lr.fit(test_data[selected_columns], test_target)
+
+predict_proba = dict()
+all_proba = pd.DataFrame() # a dataframe for the predictions
+all_proba['true'] = test_target
+
+for hours in tqdm(range(24, 128, 8), ncols=1000, desc="Hours"):
+  predict_proba[hours] = lr.predict_proba(test_data_pred[hours][selected_columns])[:,1] # the slicing chooses the probability of death for each patient
+  pred = pd.DataFrame(predict_proba[hours], index=test_data_pred[hours][selected_columns].index)
+  all_proba[hours] = pred
+
+proba_dead = all_proba[all_proba.true == 1].drop(columns='true').transpose().sort_index()
+proba_alive = all_proba[all_proba.true == 0].drop(columns='true').transpose().sort_index()
+
+df_icp['hours'] = df_icp['delta'].map(lambda x: x.total_seconds() / 60 / 60)
+df_map['hours'] = df_map['delta'].map(lambda x: x.total_seconds() / 60 / 60)
+df_cpp['hours'] = df_cpp['delta'].map(lambda x: x.total_seconds() / 60 / 60)
+
+# deceased patients
+
+for i in proba_dead.columns:  
+  fig, ax1 = plt.subplots()
+  
+  fig.set_size_inches(25, 5)
+  plt.title('Patient {} deceased'.format(i))
+  plt.xlabel("Time passed (hours)")
+  ax1.plot((proba_dead.index), proba_dead[i], label="estimate", color='red')
+  ax1.set_ylim([0,1.01])
+  ax1.set_ylabel('Estimate', fontsize=12)
+  ax1.tick_params('y', colors='red')
+  ax1.grid(visible=False)
+  
+  ax2 = ax1.twinx()
+  ax2.plot(df_icp[df_icp.id == i].hours, df_icp[df_icp.id == i].value, label='icp')
+  ax2.plot(df_map[df_map.id == i].hours, df_map[df_map.id == i].value, label='map')
+  ax2.plot(df_cpp[df_cpp.id == i].hours, df_cpp[df_cpp.id == i].value, label='cpp')
+  ax2.set_ylabel('mmHg', fontsize=12)
+  
+  fig.tight_layout()
+  plt.legend(loc=2)
+
+  fpath = '/content/drive/MyDrive/Colab Notebooks/AIP-TBI/Qvik/KI_plots/'
+  id = 'Patient_{}_deceased'.format(i)
+  pdf = '.pdf'
+  fpath = fpath + id + pdf
+  plt.savefig(fpath)
+
+# patients that survived
+
+for i in proba_alive.columns:  
+  fig, ax1 = plt.subplots()
+  
+  fig.set_size_inches(25, 5)
+  plt.title('Patient {} survived'.format(i))
+  plt.xlabel("Time passed (hours)")
+  ax1.plot((proba_alive.index), proba_alive[i], label="estimate", color='red')
+  ax1.set_ylim([0,1.01])
+  ax1.set_ylabel('Estimate', fontsize=12)
+  ax1.tick_params('y', colors='red')
+  ax1.grid(visible=False)
+  
+  ax2 = ax1.twinx()
+  ax2.plot(df_icp[df_icp.id == i].hours, df_icp[df_icp.id == i].value, label='icp')
+  ax2.plot(df_map[df_map.id == i].hours, df_map[df_map.id == i].value, label='map')
+  ax2.plot(df_cpp[df_cpp.id == i].hours, df_cpp[df_cpp.id == i].value, label='cpp')
+  ax2.set_ylabel('mmHg', fontsize=12)
+  
+  fig.tight_layout()
+  plt.legend(loc=2)
+
+  fpath = '/content/drive/MyDrive/Colab Notebooks/AIP-TBI/Qvik/KI_plots/'
+  id = 'Patient_{}_survived'.format(i)
+  pdf = '.pdf'
+  fpath = fpath + id + pdf
+  plt.savefig(fpath)
