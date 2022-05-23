@@ -1,4 +1,548 @@
-## Training of the ICP-MAP-CPP algorithm
-# Note that the included features and regression coefficients are presented in the original publications 
+## Training of the ICP-MAP-CPP algorithm. Note that the included features and regression coefficients are presented in the original publications 
 
-CODE HERE
+******* 
+
+## Create features
+
+## In our case, the most crucial part in preparing the model is feature engineering. We will analyse the monitor data time series using 4h rolling windows. In these windows we compute various statistics and inspect their trends, which results in a number of derived time series. Finally, we turn these derived series into features by computing value averages over initial 24h and final 8h windows, and including a linear trend coefficient.
+
+from sklearn.linear_model import LinearRegression
+
+def create_derived_series(df_patients, df_icp, df_map, df_cpp):
+  """ This function derives various new time series for each patient from the original ICP, MAP, and CPP data. """
+  
+  # Take the intersection of available patient ids.
+  ids = list(set(df_patients['id']) & set(df_icp['id']) & set(df_map['id']))
+  
+  # The dictionary below holds various types of derived series as keys the values of which are dictionaries indexed by patient ids.
+  # To add a new type of derived series, make and empty entry to the dictionary and provide a logic for its computation for each patient in the for loop below.
+  derived_series = {'icp': {}, 'map': {}, 'cpp': {},
+                    'icp_var': {}, 'map_var': {}, 'cpp_var': {},
+                    'icp_ht20': {}, 'map_ht120': {}, 'icp_lt10': {},
+                    'icp_diff': {}, 'map_diff': {}, 'cpp_diff': {},
+                    'icp_q10': {}, 'icp_q90': {},
+                    'map_q10': {}, 'map_q90': {},
+                    'cpp_q10': {}, 'cpp_q90': {}}
+  
+  # Set the length of the rolling window. Feel free to experiment with values other than '4h'.
+  rolling_window_length = '4h'
+
+  # Loop over patient ids and 
+  for i in tqdm(ids, ncols=1000, desc="Create series"):
+    # data as is
+    derived_series['icp'][i] = df_icp[df_icp['id'] == i].drop('id', axis=1).set_index('delta')
+    derived_series['map'][i] = df_map[df_map['id'] == i].drop('id', axis=1).set_index('delta')
+    derived_series['cpp'][i] = df_cpp[df_cpp['id'] == i].drop('id', axis=1).set_index('delta')
+    # variance
+    derived_series['icp_var'][i] = df_icp[df_icp['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).var().dropna()
+    derived_series['map_var'][i] = df_map[df_map['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).var().dropna()
+    derived_series['cpp_var'][i] = df_cpp[df_cpp['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).var().dropna()
+    # cut-off percentage
+    derived_series['icp_ht20'][i] = df_icp[df_icp['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).apply(lambda window: 100*(window > 20).mean(), raw=True)
+    derived_series['map_ht120'][i] = df_map[df_map['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).apply(lambda window: 100*(window > 120).mean(), raw=True)
+    derived_series['icp_lt10'][i] = df_icp[df_icp['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).apply(lambda window: 100*(window < 10).mean(), raw=True)
+    # magnitude of difference
+    derived_series['icp_diff'][i] = df_icp[df_icp['id'] == i].drop('id', axis=1).set_index('delta').diff().abs().rolling(rolling_window_length).mean().dropna()
+    derived_series['map_diff'][i] = df_map[df_map['id'] == i].drop('id', axis=1).set_index('delta').diff().abs().rolling(rolling_window_length).mean().dropna()
+    derived_series['cpp_diff'][i] = df_cpp[df_cpp['id'] == i].drop('id', axis=1).set_index('delta').diff().abs().rolling(rolling_window_length).mean().dropna()
+    # quantile
+    derived_series['icp_q10'][i] = df_icp[df_icp['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).quantile(0.1).dropna()
+    derived_series['icp_q90'][i] = df_icp[df_icp['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).quantile(0.9).dropna()
+    derived_series['map_q10'][i] = df_map[df_map['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).quantile(0.1).dropna()
+    derived_series['map_q90'][i] = df_map[df_map['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).quantile(0.9).dropna()
+    derived_series['cpp_q10'][i] = df_cpp[df_cpp['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).quantile(0.1).dropna()
+    derived_series['cpp_q90'][i] = df_cpp[df_cpp['id'] == i].drop('id', axis=1).set_index('delta').rolling(rolling_window_length).quantile(0.9).dropna()
+    
+  return derived_series
+
+def compute_features(series):
+  """ For a given time series, compute the initial 24h mean, the final 8h mean, and the regression coefficient. """
+  begin_mean = series[series.index < pd.to_timedelta('24h')]['value'].mean()
+  end_mean = series[series.index > series.index.values[-1] - pd.to_timedelta('8h')]['value'].mean()
+  coef = LinearRegression().fit(series.index.values.reshape(-1,1), series['value']).coef_[0]
+  return begin_mean, end_mean, coef
+
+def prepare_data(df_patients, df_icp, df_map, df_cpp):
+  """ This function prepares the full dataframe of features from the patient and monitor data. """
+  
+  ids = list(set(df_patients['id']) & set(df_icp['id']) & set(df_map['id']))
+  derived_series = create_derived_series(df_patients, df_icp, df_map, df_cpp)
+  
+  # For each type of derived series, initialize a dataframe with begin, end, and coef features.
+  feature_dfs = {name: pd.DataFrame(index=ids, columns=[name + '_begin', name + '_end', name + '_coef'], dtype=np.float32) for name in derived_series}
+  
+  #series = tqdm_notebook(derived_series, ncols=1000)
+  series = tqdm(derived_series, ncols=1000)
+  
+  # For each type of derived series populate the corresponding feature dataframe by computing the features for each patient.
+  for name in series:
+    series.set_description("%s" % name)
+    for i in ids:
+      try:  
+        feature_dfs[name].loc[i] = compute_features(derived_series[name][i])
+      except:
+        continue
+
+  # Join all the feature dataframes with the patients data.
+  monitordata = df_patients.set_index('id').join(feature_dfs.values(), how='inner')
+  monitordata.dropna(inplace=True)
+  monitordata = monitordata.sample(frac=1) # Shuffle the dataframe.
+  data = monitordata.drop('dead30', axis=1)
+  target = monitordata['dead30']
+  return data, target
+
+def multiprocess_prepare_data(df_patients, df_icp, df_map, df_cpp, return_dict, hour):
+  """ This function prepares the full dataframe of features from the patient and monitor data. """
+  
+  ids = list(set(df_patients['id']) & set(df_icp['id']) & set(df_map['id']))
+  derived_series = create_derived_series(df_patients, df_icp, df_map, df_cpp)
+  
+  # For each type of derived series, initialize a dataframe with begin, end, and coef features.
+  feature_dfs = {name: pd.DataFrame(index=ids, columns=[name + '_begin', name + '_end', name + '_coef'], dtype=np.float32) for name in derived_series}
+  
+  series = tqdm(derived_series, ncols=1000)
+  
+  # For each type of derived series populate the corresponding feature dataframe by computing the features for each patient.
+  for name in series:
+    series.set_description("%s" % name)
+    for i in ids:
+      try:  
+        feature_dfs[name].loc[i] = compute_features(derived_series[name][i])
+      except:
+        continue
+
+  # Join all the feature dataframes with the patients data.
+  monitordata = df_patients.set_index('id').join(feature_dfs.values(), how='inner')
+  monitordata.dropna(inplace=True)
+  monitordata = monitordata.sample(frac=1) # Shuffle the dataframe.
+  data = monitordata.drop('dead30', axis=1)
+  target = monitordata['dead30']
+  
+  return_dict[hour] = data
+
+data_full, target = prepare_data(df_patients, df_icp, df_map, df_cpp)
+data_full.info()
+print('Number of patients: {}'.format(len(target)))
+print('Survived at least 30 days: {}'.format(len(target[target == 0.0])))
+print('Deceased within 30 days: {}'.format(len(target[target == 1.0])))
+print('Percentage of deceased: {}%'.format(np.round(100 * len(target[target == 1.0]) / len(target), 2)))
+
+"""## Plot feature distributions
+
+Plot the distribution of each feature separately for survived and deceased.
+"""
+
+for feature in data_full.columns:
+  plt.figure(figsize=(15,5))
+  plt.title(feature)
+  sns.distplot(data_full[target == 1][feature], bins=10, hist=False, label='deceased')
+  sns.distplot(data_full[target == 0][feature], bins=10, hist=False, label='survived')
+  plt.legend()
+
+"""## Inspecting the folding methods for cross-validation.
+
+Due to the small size of the dataset, we use 5-fold cross-validation throughout the rest of the notebook. Before proceeding further we demonstrate the outcome of a number of folding methods. See [K-fold](http://scikit-learn.org/stable/modules/generated/sklearn.model_selection.KFold.html), [stratified K-fold](http://scikit-learn.org/stable/modules/generated/sklearn.model_selection.StratifiedKFold.html), and [repeated stratified K-fold](http://scikit-learn.org/stable/modules/generated/sklearn.model_selection.RepeatedStratifiedKFold.html). We use stratified K-fold in order to retain the target distribution in train/test splits, and often its repeated version to average out fluctuations between splits.
+"""
+
+from sklearn.model_selection import KFold, StratifiedKFold, RepeatedStratifiedKFold
+
+#fold_method = KFold(n_splits=5, shuffle=True)
+fold_method = StratifiedKFold(n_splits=5, shuffle=True)
+#fold_method = RepeatedStratifiedKFold(n_splits=5, n_repeats=10)
+
+for splitnb, (train_index, test_index) in enumerate(fold_method.split(data_full, target)):
+  print('Split number {}:'.format(splitnb + 1))
+  print('Number of train / test instances: {} / {}'.format(len(train_index), len(test_index)))
+  print('% of deceased in train / test: {}% / {}%'.format(np.round(100 * target.iloc[train_index].mean(),2), np.round(100 * target.iloc[test_index].mean(),2)))
+  print()
+
+"""## Normalize data & select features
+
+Normalize the data.
+"""
+
+from sklearn.preprocessing import StandardScaler
+
+scaler = StandardScaler()
+data_scaled = pd.DataFrame(data=scaler.fit_transform(data_full), index=data_full.index, columns=data_full.columns)
+
+"""We select features using [recursive feature elimination](http://scikit-learn.org/stable/modules/generated/sklearn.feature_selection.RFECV.html). Sets of features are evaluated by area under ROC curve in cross-validated logistic regression."""
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.feature_selection import RFECV
+
+found = False
+
+while not found:
+  lr = LogisticRegression()
+  
+  global rfecv
+  rfecv = RFECV(estimator=lr, step=1, cv=RepeatedStratifiedKFold(n_splits=5, n_repeats=10), scoring='roc_auc')
+  rfecv.fit(data_scaled, target)
+  if rfecv.n_features_ >= 8 and rfecv.n_features_ <=18:
+    found = True
+
+"""Plot number of features VS. cross-validation scores"""
+
+optimal_num_features = rfecv.n_features_
+plt.figure(figsize=(16,12))
+plt.title("Optimal number of features: {}".format(optimal_num_features))
+plt.xlabel("Number of features selected")
+plt.ylabel("Cross-validation score (ROC AUC)")
+plt.plot(range(1, len(rfecv.grid_scores_) + 1), rfecv.grid_scores_)
+#plt.savefig('images/without_gcs/feature_count.png')
+plt.show()
+plt.close()
+
+"""Select the features."""
+
+selected_columns = data_scaled.columns[rfecv.support_]
+data = data_scaled[selected_columns]
+
+print ("Number of selected features: " + str(len(data.columns)))
+print ("Selected features:")
+print (data.columns)
+
+"""We plot the correlation matrix."""
+
+fig, ax = plt.subplots(figsize=(25,20))
+sns.set(font_scale=1.4)
+sns.heatmap(data.corr(), annot=True, fmt=".2f", ax=ax, cmap="Blues")
+plt.show()
+sns.set(font_scale=1.0)
+#plt.savefig('images/without_gcs/feature_correlations.png')
+plt.close()
+
+"""Plot relative feature importances."""
+
+lr = LogisticRegression()
+lr.fit(data, target)
+feature_importance = abs(lr.coef_[0])
+feature_importance = 100.0 * (feature_importance / feature_importance.max())
+sorted_idx = np.argsort(feature_importance)
+pos = np.arange(sorted_idx.shape[0]) + .5
+
+featfig = plt.figure(figsize=(16,12))
+featax = featfig.add_subplot(1, 1, 1)
+featax.barh(pos, feature_importance[sorted_idx], align='center')
+featax.set_yticks(pos)
+featax.set_yticklabels(np.array(data.columns)[sorted_idx], fontsize=10)
+featax.set_xlabel('Relative Feature Importance')
+
+#plt.savefig('images/without_gcs/relative_feature_importances.png')
+plt.show()
+plt.close()
+
+"""## Fit models and cross-validate
+
+We proceed to fitting and evaluating a logistic regression model. We will adjust the regularization coefficient `C` and the class weight `w` by using (black-box) Bayesian optimization.
+"""
+
+from sklearn.model_selection import cross_validate
+
+def lrcv(C, w):
+    scoring = ['roc_auc']
+    scores = cross_validate(LogisticRegression(C=C,  class_weight={0:1,1:w}), 
+                            data, 
+                            target, 
+                            scoring=scoring, 
+                            cv=RepeatedStratifiedKFold(n_splits=5, n_repeats=10))
+    val = scores['test_roc_auc'].mean()
+    return val
+
+!pip install bayesian-optimization
+from bayes_opt import BayesianOptimization
+
+gp_params = {"alpha": 1e-5}
+
+BO = BayesianOptimization(lrcv, {'C': (0.01,10), 'w': (1,1)})
+
+BO.maximize(n_iter=20, acq = "ucb", **gp_params) # Try increasing the n_iter parameter to run the optimization longer.
+#BO.maximize(n_iter=20, alpha=1e-5)
+print('-' * 53)
+
+print('Final Results')
+print(BO.max)
+#print('Classifier: %f' % BO.res['max']['max_val'])
+
+C = BO.max['params']['C']
+w = BO.max['params']['w']
+lr = LogisticRegression(C=C, class_weight={0:1,1:w})
+
+scoring = ['roc_auc', 'precision', 'recall', 'f1']
+scores = cross_validate(lr, data, target, scoring=scoring, cv=RepeatedStratifiedKFold(n_splits=5, n_repeats=10), return_train_score=True)
+
+print('Averages of training scores:')
+print('rocauc\tpreci\trecall\tf1')
+print('{roc_auc:0.2f}\t{precision:0.2f}\t{recall:0.2f}\t{f1:0.2f}'.format(roc_auc=scores['train_roc_auc'].mean(),
+                                                                          precision=scores['train_precision'].mean(),
+                                                                          recall=scores['train_recall'].mean(),
+                                                                          f1=scores['train_f1'].mean()))
+
+print('Averages of testing scores:')
+print('rocauc\tpreci\trecall\tf1')
+print('{roc_auc:0.2f}\t{precision:0.2f}\t{recall:0.2f}\t{f1:0.2f}'.format(roc_auc=scores['test_roc_auc'].mean(),
+                                                                          precision=scores['test_precision'].mean(),
+                                                                          recall=scores['test_recall'].mean(),
+                                                                          f1=scores['test_f1'].mean()))
+
+"""## Prediction on the full dataset
+
+We illustrate the model performance by making predictions of the full dataset. In order to truthfully report the performance we use ["cross-validated predictions"](http://scikit-learn.org/stable/modules/generated/sklearn.model_selection.cross_val_predict.html). Here, for each data point the prediction is obtained from a model that was fitted without using this point.
+"""
+
+from sklearn.model_selection import cross_val_predict, LeaveOneOut
+
+pred_proba = cross_val_predict(lr, data, target, cv=LeaveOneOut(), method='predict_proba')
+
+"""We store the outcome in a dataframe and plot both a normalized histogram and a (estimated) continuous distribution for survived and deceased separately."""
+
+results = pd.DataFrame()
+results['true'] = target
+#results['true'] = target_selected
+results['pred_proba'] = pred_proba[:,1]
+
+plt.figure(figsize=(15,5))
+plt.title("Prediction probabilites survived & deceased (normalized histogram)")
+plt.ylabel("Density")
+sns.distplot(results[results['true'] == 1]['pred_proba'], bins=10, kde=False, label='deceased', norm_hist=True)
+sns.distplot(results[results['true'] == 0]['pred_proba'], bins=10, kde=False, label='survived', norm_hist=True)
+plt.xlabel("Predicted probability")
+plt.legend()
+
+plt.figure(figsize=(15,5))
+plt.title("Prediction probabilites survived & deceased (kde)")
+plt.ylabel("Density")
+sns.distplot(results[results['true'] == 1]['pred_proba'], bins=10, hist=False, label='deceased')
+sns.distplot(results[results['true'] == 0]['pred_proba'], bins=10, hist=False, label='survived')
+plt.xlabel("Predicted probability")
+plt.legend()
+
+"""In order to make strict classifications and compute the accuracy, we set a threshold."""
+
+threshold = 0.5
+results['pred'] = 1 * (results['pred_proba'] > threshold)
+
+"""The misclassifications are examined below."""
+
+#results[results['true'] != results['pred']].to_csv('images/without_gcs/misclassifications.csv')
+
+with pd.option_context('display.max_rows', None, 'display.max_columns', None):
+    print(results[results['true'] != results['pred']])
+
+from sklearn.metrics import confusion_matrix, accuracy_score
+
+print('Accuracy: {}%'.format(np.round(100 * accuracy_score(results['true'], results['pred']), 2)))
+print()
+print('Confusion matrix:')
+cm = confusion_matrix(results['true'], results['pred'])
+print(cm)
+print()
+print("False positives: {}".format(cm[0][1]))
+print("False negatives: {}".format(cm[1][0]))
+
+"""## Calculate features for each time window (multiprocess)"""
+
+from sklearn.preprocessing import StandardScaler
+
+# Calculate features for the full dataset
+data_full, target = prepare_data(df_patients, df_icp, df_map, df_cpp)
+
+# Scale the features
+scaler = StandardScaler()
+data_scaled = pd.DataFrame(data=scaler.fit_transform(data_full), index=data_full.index, columns=data_full.columns)
+
+# Sort indices
+data = data_scaled.sort_index()
+target = target.sort_index()
+
+# Create dictionaries for the features
+data_full_pred = dict()  # All the features computed from truncated time series 
+data_pred = dict()  # All the scaled features
+
+import multiprocessing as mp
+
+hours = range(24, 128, 8)
+manager = mp.Manager()
+data_full_pred = manager.dict()
+n_cores = 4
+
+# created pool running maximum 4 cores
+pool = mp.Pool(n_cores)
+
+# Execute the feature calculation in parallel
+for hour in hours:
+    pool.apply_async(multiprocess_prepare_data, args=(df_patients, 
+                                                      df_icp[df_icp.delta < str(hour) + "h"],
+                                                      df_map[df_map.delta < str(hour) + "h"],
+                                                      df_cpp[df_cpp.delta < str(hour) + "h"],
+                                                      data_full_pred, 
+                                                      hour))
+
+# Tell the pool that there are no more tasks to come and join
+pool.close()
+pool.join()
+
+for hour in hours:
+  data_pred[hour] = pd.DataFrame(data=scaler.transform(data_full_pred[hour]), index=data_full_pred[hour].index, columns=data_full_pred[hour].columns)
+  data_pred[hour] = data_pred[hour].sort_index()
+
+
+"""# Calculate cross-validated AUC-ROC"""
+
+from sklearn.model_selection import KFold, StratifiedKFold, RepeatedStratifiedKFold
+from sklearn.metrics import roc_curve, auc, roc_auc_score
+from scipy import interp
+
+fold_method = RepeatedStratifiedKFold(n_splits=5, n_repeats=20)
+lr_model = LogisticRegression(C=C, class_weight={0:1,1:w})
+
+aucs_train = dict()
+aucs_test = dict()
+for hours in range(24, 128, 8):
+  aucs_train[hours] = list()
+  aucs_test[hours] = list()
+
+selected_columns = data.columns[rfecv.support_]
+data = data[selected_columns]
+  
+for train_indices, test_indices in fold_method.split(data, target):
+  # train_indices and test_indices are positional indices, transforming them to patient_ids:
+  train_patients, test_patients = data.index[train_indices], data.index[test_indices]
+  
+  # Train the fold specific model with full time series
+  classifier = lr_model.fit(data.loc[train_patients], target.loc[train_patients])
+  
+  # Calculate metrics for each time window
+  for hours in range(24, 128, 8):
+    preds_train = classifier.predict_proba(data_pred[hours][selected_columns].loc[train_patients])[:,1]
+    preds_test = classifier.predict_proba(data_pred[hours][selected_columns].loc[test_patients])[:,1]
+    
+    score_train = roc_auc_score(target.loc[train_patients], preds_train)
+    score_test = roc_auc_score(target.loc[test_patients], preds_test)
+    
+    aucs_train[hours].append(score_train)
+    aucs_test[hours].append(score_test)
+
+"""# Calculate hourly AUC means, AUC standard deviations and plot hourly AUCs with their error estimates"""
+
+def auc_stats(aucs):
+  aucs_mean = []
+  aucs_std = []
+  aucs_lower = []
+  aucs_upper = []
+
+  for hours in range(24, 128, 8):
+    mean = np.mean(aucs[hours])
+    aucs_mean.append(mean)
+
+    std = np.std(aucs[hours])
+    aucs_std.append(std)
+
+    lower = mean - std
+    aucs_lower.append(lower)
+
+    upper = mean + std
+    aucs_upper.append(upper)
+    
+  return aucs_mean, aucs_lower, aucs_upper
+
+aucs_train_mean, aucs_train_lower, aucs_train_upper = auc_stats(aucs_train)
+aucs_test_mean, aucs_test_lower, aucs_test_upper = auc_stats(aucs_test)
+
+time = range(24, 128, 8)
+
+plt.figure(figsize=(16,12))
+plt.plot(time, aucs_train_mean, color='black', linestyle='--', label=r'AUROC $\pm$ 1 std. dev. (train)')
+plt.plot(time, aucs_test_mean, color='red', label=r'AUROC $\pm$ 1 std. dev. (validation)')
+plt.fill_between(time, aucs_train_lower, aucs_train_upper, color='black', alpha=.2)
+plt.fill_between(time, aucs_test_lower, aucs_test_upper, color='red', alpha=.1)
+plt.xlabel('Time (h)')
+plt.ylabel('Area under ROC')
+plt.legend(loc='upper right')
+plt.ylim((0.6,1.0))
+
+plt.show()
+
+"""#### View the predictions dynamically
+
+One of the central requirements for our model was to have it predict dynamically, i.e. to make it sensitive to changes in the ICP-MAP measurements for each patient. The features facilitating this are naturally the final 8h means of each derived series as well as their linear trend coefficients. Below we illustrate this by rolling out the monitor data in 8 hour windows and predicting as we go.
+
+Notice that the model is fit on the full dataset of untruncated time series. While the rolled out monitor data is in principle unseen to the model, some features such as the initial 24h means do not change. One should therefore view this primarily as an illustration and not a test.
+
+Computing the features for each 8h step takes a few minutes.
+"""
+
+lr = LogisticRegression(C=C, class_weight={0:1,1:w})
+lr.fit(data[selected_columns], target)
+
+predict_proba = dict()
+all_proba = pd.DataFrame() # a dataframe for the predictions
+all_proba['true'] = target
+
+for hours in tqdm(range(24, 128, 8), ncols=1000, desc="Hours"):
+  predict_proba[hours] = lr.predict_proba(data_pred[hours][selected_columns])[:,1] # the slicing chooses the probability of death for each patient
+  pred = pd.DataFrame(predict_proba[hours], index=data_pred[hours].index)
+  all_proba[hours] = pred
+
+
+proba_dead = all_proba[all_proba.true == 1].drop(columns='true').transpose().sort_index()
+proba_alive = all_proba[all_proba.true == 0].drop(columns='true').transpose().sort_index()
+
+df_icp['hours'] = df_icp['delta'].map(lambda x: x.total_seconds() / 60 / 60)
+df_map['hours'] = df_map['delta'].map(lambda x: x.total_seconds() / 60 / 60)
+df_cpp['hours'] = df_cpp['delta'].map(lambda x: x.total_seconds() / 60 / 60)
+
+"""It is interesting to view how the predictions evolve for patients who deceased. We plot the predictions on top of their ICP-MAP-CPP data."""
+
+for i in proba_dead.columns:  
+  fig, ax1 = plt.subplots()
+  
+  fig.set_size_inches(25, 5)
+  plt.title('Patient {} deceased'.format(i))
+  plt.xlabel("Time passed (hours)")
+  p0, = ax1.plot((proba_dead.index), proba_dead[i], label="estimate", color='red')
+  ax1.set_ylim([0,1.01])
+  ax1.set_ylabel('Estimate', fontsize=12)
+  ax1.tick_params('y', colors='red')
+  ax1.grid(visible=False)
+  
+  ax2 = ax1.twinx()
+  p1, = ax2.plot(df_icp[df_icp.id == i].hours, df_icp[df_icp.id == i].value, label='icp')
+  p2, = ax2.plot(df_map[df_map.id == i].hours, df_map[df_map.id == i].value, label='map')
+  p3, = ax2.plot(df_cpp[df_cpp.id == i].hours, df_cpp[df_cpp.id == i].value, label='cpp')
+  ax2.set_ylim([0, 150])
+  ax2.set_ylabel('mmHg', fontsize=12)
+  
+  lines = [p0, p1, p2, p3]
+  
+  ax2.legend(lines, [l.get_label() for l in lines], loc=2)
+  
+  fig.tight_layout()
+  plt.close()
+
+for i in proba_alive.columns:  
+  fig, ax1 = plt.subplots()
+  
+  fig.set_size_inches(25, 5)
+  plt.title('Patient {} survived'.format(i))
+  plt.xlabel("Time passed (hours)")
+  p0, = ax1.plot((proba_alive.index), proba_alive[i], label="estimate", color='red')
+  ax1.set_ylim([0,1.01])
+  ax1.set_ylabel('Estimate', fontsize=12)
+  ax1.tick_params('y', colors='red')
+  ax1.grid(visible=False)
+  
+  ax2 = ax1.twinx()
+  p1, = ax2.plot(df_icp[df_icp.id == i].hours, df_icp[df_icp.id == i].value, label='icp')
+  p2, = ax2.plot(df_map[df_map.id == i].hours, df_map[df_map.id == i].value, label='map')
+  p3, = ax2.plot(df_cpp[df_cpp.id == i].hours, df_cpp[df_cpp.id == i].value, label='cpp')
+  ax2.set_ylim([0, 150])
+  ax2.set_ylabel('mmHg', fontsize=12)
+  
+  lines = [p0, p1, p2, p3]
+  
+  ax2.legend(lines, [l.get_label() for l in lines], loc=2)
+  
+  fig.tight_layout()
+  plt.close()
